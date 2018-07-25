@@ -1,0 +1,913 @@
+#include <opencv/highgui.h> 
+#include <opencv/cv.h> 
+
+#include "opencv2/core/core.hpp"
+#include "opencv2/highgui/highgui.hpp"
+
+#include <iostream>
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h> /*用到了time函数，所以要有这个头文件*/
+#include <fstream>
+#include <sstream>
+#include <exception>
+#include <vector>
+#include <io.h>
+#include <stdio.h>
+#include <math.h>
+#include <omp.h>
+#include <windows.h>
+
+#include "CNN.h"
+#include "global.h"
+#include "mnist.h"
+
+using namespace cv;
+using namespace std;
+
+int numLine1 = 0; //第一行字符个数
+int numLine2 = 0; //第二行字符个数
+#define showSteps 1
+#define saveImage 1
+
+int an =1;
+int element_shape = CV_SHAPE_RECT;
+IplConvKernel* element = cvCreateStructuringElementEx( an*2+1, an*2+1, an, an, element_shape, 0 );
+
+LARGE_INTEGER m_liPerfFreq;
+LARGE_INTEGER m_liPerfStart;
+LARGE_INTEGER liPerfNow;
+double dfTim;
+void getStartTime()
+{
+    QueryPerformanceFrequency(&m_liPerfFreq);
+    QueryPerformanceCounter(&m_liPerfStart);
+}
+
+void getEndTime()
+{
+    QueryPerformanceCounter(&liPerfNow);
+    dfTim=( ((liPerfNow.QuadPart - m_liPerfStart.QuadPart) * 1000.0f)/m_liPerfFreq.QuadPart);
+}
+
+//config.txt为要处理的跟目录，在训练model中，config.txt中的内容为训练是的样本库，1-13分类好了。--
+//在样本筛选model中，config.txt里的内容为要筛选的样本库，未分类。---
+char * configFile = "config.txt";
+
+//读取config文件里的内容--
+char* trainSetPosPath = (char *)malloc(200*sizeof(char));
+void readConfig(char* configFile, char* trainSetPosPath){
+    fstream f;
+    char cstring[1000];
+    int readS=0;
+    f.open(configFile, fstream::in);
+    char param1[200]; strcpy(param1,"");
+    char param2[200]; strcpy(param2,"");
+    char param3[200]; strcpy(param3,"");
+
+    //--读取第一行：--
+    f.getline(cstring, sizeof(cstring));
+    readS=sscanf (cstring, "%s %s %s", param1,param2, param3);
+    strcpy(trainSetPosPath,param3);
+
+    //--读取第二行：-- 字符个数
+    f.getline(cstring, sizeof(cstring));
+    readS=sscanf (cstring, "%s %s %i", param1,param2, &numLine1);
+
+    //--读取第三行：-- 字符个数
+    f.getline(cstring, sizeof(cstring));
+    readS=sscanf (cstring, "%s %s %i", param1,param2, &numLine2);
+
+}
+
+//遍历config.txt里的根目录下的所有的文件，包括子目录。--
+// 其中子目录的名字就是label，子目录里的文件为label对于的训练测试样本---
+vector<string> imgNames;
+int labelTemp = 0;
+
+void dfsFolder(string folderPath){
+    _finddata_t FileInfo;
+    string strfind = folderPath + "\\*";
+    long Handle = _findfirst(strfind.c_str(), &FileInfo);
+    if (Handle == -1L)
+    {
+        cerr << "can not match the folder path" << endl;
+        exit(-1);
+    }
+    do{
+        //判断是否有子目录--
+        if (FileInfo.attrib & _A_SUBDIR)        {
+            //  cout<<FileInfo.name<<" "<<FileInfo.attrib<<endl;
+            //这个语句很重要--
+            if( (strcmp(FileInfo.name,".") != 0 ) &&(strcmp(FileInfo.name,"..") != 0))          {
+                string newPath = folderPath + "\\" + FileInfo.name;
+                cout<<FileInfo.name<<" "<<newPath<<endl;
+                //根目录下下的子目录名字就是label名，如果没有子目录则其为根目录下
+                labelTemp = atoi(FileInfo.name);
+                //  printf("%d\n",labelTemp);
+                dfsFolder(newPath);
+            }
+        }else  {
+            string finalName = folderPath + "\\" + FileInfo.name;
+            //将所有的文件名写入一个txt文件--
+            //  cout << FileInfo.name << "\t";
+            //  printf("%d\t",label);
+            //  cout << folderPath << "\\" << FileInfo.name  << " " <<endl;
+            //将文件名字和label名字（子目录名字赋值给向量）--
+
+            imgNames.push_back(finalName);
+
+        }
+    }while (_findnext(Handle, &FileInfo) == 0);
+    _findclose(Handle);
+
+}
+
+void initTrainImage(){
+    readConfig(configFile, trainSetPosPath);
+
+    string folderPath = trainSetPosPath;
+    dfsFolder(folderPath);
+
+}
+
+//CNN识别初始化部分
+void init(){
+
+
+    m_bTestSetOpen = m_bTrainingSetOpen = false;
+
+
+    m_bStatusTraining = false;
+    m_bStatusTesting = false;
+
+
+    m_iCountTotal = 0;
+    m_iCountError = 0;
+
+    m_dDispX = new double[g_cVectorSize * g_cVectorSize];
+    m_dDispY = new double[g_cVectorSize * g_cVectorSize];
+
+    m_etaLearningRate = 0.00005;
+
+}
+
+void Calculate(IplImage *img){
+
+
+    //// Also create a color image (for display)
+    //IplImage *colorimg = cvCreateImage( inputsz, IPL_DEPTH_8U, 3 );
+
+    //get image data
+    int index = 0;
+    for(int i = 0; i < img->height; ++i){
+        for(int j = 0; j < img->width; ++j){
+            index = i*img->width + j;
+            grayArray[index] = ((uchar*)(img->imageData + i*img->widthStep))[j] ;         //为像素赋值
+        }   
+    }
+
+    int ii, jj;
+
+    //copy gray scale image to a double input vector in -1 to 1 range
+    // one is white, -one is black
+    for ( ii=0; ii<g_cVectorSize * g_cVectorSize; ++ii ) inputVector[ii] = 1.0;
+    for ( ii=0; ii<g_cImageSize; ++ii )
+    {
+        for ( jj=0; jj<g_cImageSize; ++jj )
+        {
+            int idxVector = 1 + jj + g_cVectorSize * (1 + ii);
+            int idxImage = jj + g_cImageSize * ii;
+
+            inputVector[ idxVector ] = double(255 - grayArray[ idxImage ])/128.0 - 1.0;  
+        }
+    }
+
+    //call forward propagation function of CNN
+    m_iOutput = m_cnn.Calculate(inputVector, outputVector);
+
+}
+
+
+uchar lut[256];
+CvMat* lut_mat;
+IplImage * dehist(IplImage * src_image, int _brightness, int _contrast){
+    IplImage *dst_image = cvCreateImage(cvGetSize(src_image),8,src_image->nChannels);
+    cvCopy(src_image,dst_image);
+
+    int brightness = _brightness - 100;
+    int contrast = _contrast - 100;
+    int i;
+    float max_value = 0;
+
+    if( contrast > 0 )
+    {
+        double delta = 127.*contrast/100;
+        double a = 255./(255. - delta*2);
+        double b = a*(brightness - delta);
+        for( i = 0; i < 256; i++ )
+        {
+            int v = cvRound(a*i + b);
+            if( v < 0 )
+                v = 0;
+            if( v > 255 )
+                v = 255;
+            lut[i] = (uchar)v;
+        }
+    }
+    else
+    {
+        double delta = -128.*contrast/100;
+        double a = (256.-delta*2)/255.;
+        double b = a*brightness + delta;
+        for( i = 0; i < 256; i++ )
+        {
+            int v = cvRound(a*i + b);
+            if( v < 0 )
+                v = 0;
+            if( v > 255 )
+                v = 255;
+            lut[i] = (uchar)v;
+        }
+    }
+
+    lut_mat = cvCreateMatHeader( 1, 256, CV_8UC1 );
+    cvSetData( lut_mat, lut, 0 );
+    cvLUT( src_image, dst_image, lut_mat );
+    if(showSteps)
+        cvShowImage( "dst_image", dst_image );
+
+    IplImage* gray_image = cvCreateImage(cvGetSize(src_image),8,1);
+    cvCvtColor(dst_image, gray_image, CV_BGR2GRAY);
+
+    IplImage* bin_image = cvCreateImage(cvGetSize(src_image),8,1);
+//  int blockSize = 11;  
+//  int constValue = 9;       
+//  cvAdaptiveThreshold(gray_image, bin_image, 255, CV_ADAPTIVE_THRESH_MEAN_C, CV_THRESH_BINARY, blockSize, constValue);  
+    cvThreshold(gray_image,bin_image,1,255,CV_THRESH_BINARY+CV_THRESH_OTSU);
+    if(showSteps)
+        cvShowImage( "bin_image", bin_image );
+
+    //  OpenClose(bin_image,bin_image,-1);
+
+    //cvErode(bin_image,bin_image,element,1);
+    //cvDilate(bin_image,bin_image,element,8);
+
+    cvReleaseImage(&dst_image);
+    cvReleaseImage(&gray_image);
+    return bin_image;
+}
+
+IplImage * projectY(IplImage * src){
+    IplImage *imgBin = cvCreateImage(cvGetSize(src),8,src->nChannels);
+    cvCopy(src,imgBin);
+    cvNot(src,imgBin);
+    //Y轴投影 确定字符具体区域
+        IplImage* painty=cvCreateImage( cvGetSize(imgBin),IPL_DEPTH_8U, 1 );        
+        cvZero(painty);  
+        int* h=new int[imgBin->height];         
+        memset(h,0,imgBin->height*4);  
+
+        int x,y;  
+        CvScalar s,t;  
+        for(y=0;y<imgBin->height;y++)  
+        {  
+            for(x=0;x<imgBin->width;x++)  
+            {  
+                s=cvGet2D(imgBin,y,x);           
+                if(s.val[0]==0)  
+                    h[y]++;       
+            }     
+        } 
+
+        //将y投影后，值小于50的赋值为0
+        for(y=0;y<imgBin->height;y++)   {  
+            if((imgBin->width-h[y]) <= 13)
+                h[y] = imgBin->width;
+        //  printf("%d ",imgBin->width-h[y]); 
+        }
+
+        //将Y轴上 很窄的线段，即横着的很长的细线直接抹掉
+        for(x=0;x<painty->height;x++)  {
+            for(y=x;y<painty->height;y++)  {
+                if( (h[x] == h[y])&&(h[y] == painty->width)&&(y-x <= 3) ){
+                    for(int i=x;i<=y;i++){
+                        h[i] = painty->width;
+                    }
+                }
+                if( (h[x] != painty->width)&&(h[y] == painty->width)&&(y-x <= 3) ){
+                    for(int i=x;i<=y;i++){
+                        h[i] = painty->width;
+                    }
+                } 
+
+            }
+        }
+
+
+        for(y=0;y<imgBin->height;y++)  
+        {  
+            for(x=0;x<h[y];x++)  
+            {             
+                t.val[0]=255;  
+                cvSet2D(painty,y,x,t);            
+            }         
+        } 
+        //确定Y轴字符的收尾，确定字符区域的高度
+        //查找paintx首尾两端的x轴坐标
+        int xLeft = 0;
+        for(x=0;x<painty->height-2;x++){
+            if ( cvGet2D(painty,x,painty->width - 1).val[0]== 0 ){
+                xLeft = x;
+                break;  
+            }
+            if( (cvGet2D(painty,x,painty->width - 1).val[0] == 255)&&(cvGet2D(painty,x+1,painty->width - 1).val[0] == 0) ){
+                xLeft = x;
+                break;  
+            }
+        }
+        if(showSteps)
+            cout<<"列字符区域上边字符起始点是："<<xLeft<<endl;
+
+        int xRight = 0;
+        for(x=painty->height-1; x>0 ;x--){  
+            if ( cvGet2D(painty,x,painty->width - 1).val[0]== 0 ){
+                xRight = x;
+                break;  
+            }
+            if( (cvGet2D(painty,x,painty->width - 1).val[0]== 255)&&(cvGet2D(painty,x-1,painty->width - 1).val[0] == 0) ){
+                xRight = x;
+                break;  
+            }
+        }
+        if(xRight == 0)  xRight = painty->height;
+        if(showSteps)
+            cout<<"列字符区域下边字符起始点是："<<xRight<<endl;
+
+
+        if(showSteps){  
+            cvNamedWindow("水平积分投影",1);           
+            cvShowImage("水平积分投影",painty);  
+        }
+
+        IplImage * image = cvCreateImage(cvSize((src->width),xRight - xLeft + 4),8,src->nChannels);
+        CvRect rect;
+        rect.height = xRight - xLeft+4 ;
+        rect.width = src->width;
+        rect.x = 0;
+        rect.y = xLeft-2;
+        cvSetImageROI(src,rect);
+        cvCopy(src,image);
+        cvResetImageROI(src);
+
+
+        cvReleaseImage(&imgBin);
+    //  cvReleaseImage(&src);
+        cvReleaseImage(&painty);
+
+        cvNamedWindow("image1",1);
+        cvShowImage("image1",image);
+
+        return image;
+}
+
+
+IplImage* projectX(IplImage * src){
+    // cvSmooth(src,src,CV_BLUR,3,3,0,0);
+    IplImage * srcTemp = cvCreateImage(cvGetSize(src),8,src->nChannels);
+    cvCopy(src,srcTemp);
+
+    cvThreshold(src,src,50,255,CV_THRESH_BINARY_INV+CV_THRESH_OTSU);
+    IplImage* paintx=cvCreateImage(cvGetSize(src),IPL_DEPTH_8U, 1 );
+    cvZero(paintx);
+    int* v=new int[src->width];
+    int tempx=src->height;
+//  CvPoint xPoint;
+    int tempy=src->width;
+    memset(v,0,src->width*4);  
+
+
+    int x,y;
+    CvScalar s,t;
+    for(x=0;x<src->width;x++){
+        for(y=0;y<src->height;y++){
+            s=cvGet2D(src,y,x);
+            if(s.val[0]==0)
+                v[x]++;  
+        } 
+    }
+
+    //将x投影后，值小于2的赋值为0
+    for(x=0;x<src->width;x++)  {  
+        if((src->height-v[x]) <= 3)
+            v[x] = src->height;
+    //  printf("%d ",src->height-v[x]); 
+    } 
+
+    //若投影后出现很细的竖直黑线，将这条黑线去掉
+    for(x=0;x<paintx->width;x++)  {
+        for(y=x;y<paintx->width;y++)  {
+            if( (v[x] == v[y])&&(v[y] == paintx->height)&&(y-x < 3) ){
+                for(int i=x;i<=y;i++){
+                    v[i] = paintx->height;
+                }
+            }
+            if( (v[x] != paintx->width)&&(v[y] == paintx->width)&&(y-x <= 3) ){
+                for(int i=x;i<=y;i++){
+                    v[i] = paintx->height;
+                }
+            } 
+        }
+    }
+
+    for(x=0;x<src->width;x++){
+        for(y=0;y<v[x];y++){ 
+            t.val[0]=255;
+            cvSet2D(paintx,y,x,t);
+        } 
+    }
+
+    //查找paintx首尾两端的x轴坐标
+    int xLeft = 0;
+    for(x=0;x<paintx->width;x++){   
+            if( (cvGet2D(paintx,paintx->height - 3,x).val[0] == 255)&&(cvGet2D(paintx,paintx->height - 3,x+1).val[0] == 0) ){
+                xLeft = x;
+                break;  
+            }
+    }
+    if(showSteps)
+        cout<<"行字符区域左边字符起始点是："<<xLeft<<endl;
+
+    int xRight = 0;
+    for(x=paintx->width-1; x>0 ;x--){   
+        if( (cvGet2D(paintx,paintx->height - 1,x).val[0]== 255)&&(cvGet2D(paintx,paintx->height - 1,x-1).val[0] == 0) ){
+            xRight = x;
+            break;  
+        }
+    }
+    if(showSteps)
+        cout<<"行字符区域左边字符起始点是："<<xRight<<endl;
+
+    if(showSteps){
+        cvNamedWindow("二值图像",1);
+        cvNamedWindow("垂直积分投影",1);
+        cvShowImage("二值图像",src);
+        cvShowImage("垂直积分投影",paintx);
+    }
+
+    IplImage * image = cvCreateImage(cvSize((xRight - xLeft),src->height),8,src->nChannels);
+    CvRect rect;
+    rect.height = src->height;
+    rect.width = xRight - xLeft;
+    rect.x = xLeft;
+    rect.y = 0;
+    cvSetImageROI(srcTemp,rect);
+    cvCopy(srcTemp,image);
+    cvResetImageROI(srcTemp);
+
+
+    cvReleaseImage(&src);
+    cvReleaseImage(&srcTemp);
+    cvReleaseImage(&paintx);
+
+    //cvNamedWindow("image",1);
+    //cvShowImage("image",image);
+
+    //cvWaitKey(0);
+    return image;
+}
+
+
+char recVifcode(IplImage *src){
+
+    // Grayscale img pointer
+    if (!src){
+        cout << "ERROR: Bad image file: " <<  endl; 
+
+        //  continue;
+    }
+
+    CvSize inputsz = cvSize(28,28);
+    // Grayscale img pointer
+    IplImage* img = cvCreateImage( inputsz, IPL_DEPTH_8U, 1 );
+
+    // create some GUI
+    if(showSteps){
+        cvNamedWindow("Image", CV_WINDOW_AUTOSIZE); 
+        cvMoveWindow("Image", inputsz.height, inputsz.width);
+
+    }
+
+    cvResize(src,img,CV_INTER_CUBIC);
+
+    Calculate(img);
+
+    if(showSteps){
+        cvShowImage("Image",img);
+    }
+
+    /*IplImage* imgDistorted = cvCreateImage( inputsz, IPL_DEPTH_8U, 1 );
+    cvCopy(img,imgDistorted);
+    for(int i = 0; i < imgDistorted->height; ++i){
+    for(int j = 0; j < imgDistorted->width; ++j){
+    ((uchar*)(imgDistorted->imageData + i*imgDistorted->widthStep))[j] =  
+    (unsigned char) int (255 - 255 * (inputVector[(i+1)*g_cVectorSize + j + 1] + 1)/2);  
+    }   
+    }
+    if(showSteps){
+    cvNamedWindow("imgDistorted", CV_WINDOW_AUTOSIZE); 
+    cvShowImage("imgDistorted",imgDistorted);
+    }*/
+
+
+    //  cout<<"识别结果为："<<m_iOutput<<endl;
+    char outputChar = NULL;
+    if(m_iOutput == 0) outputChar = '0';
+    if(m_iOutput == 1) outputChar = '1';
+    if(m_iOutput == 2) outputChar = '2';
+    if(m_iOutput == 3) outputChar = '3';
+    if(m_iOutput == 4) outputChar = '4';
+    if(m_iOutput == 5) outputChar = '5';
+    if(m_iOutput == 6) outputChar = '6';
+    if(m_iOutput == 7) outputChar = '7';
+    if(m_iOutput == 8) outputChar = '8';
+    if(m_iOutput == 9) outputChar = '9';
+    if(m_iOutput == 10) outputChar = 'A';
+    if(m_iOutput == 11) outputChar = 'B';
+    if(m_iOutput == 12) outputChar = 'U';
+    if(m_iOutput == 13) outputChar = 'D';
+    if(m_iOutput == 14) outputChar = 'P';
+    if(m_iOutput == 15) outputChar = 'R';
+    if(m_iOutput == 16) outputChar = 'S';
+    if(m_iOutput == 17) outputChar = 'T';
+    if(m_iOutput == 18) outputChar = 'U';
+    if(m_iOutput == 19) outputChar = 'X';
+    if(m_iOutput == 20) outputChar = 'Y';
+
+
+    //  cout<<"识别结果为："<<outputChar<<endl;
+
+    return outputChar;
+}
+
+void saveImages(IplImage * image){
+    SYSTEMTIME stTime;
+
+    GetLocalTime(&stTime);
+    char pVideoName[256];
+    sprintf(pVideoName, ".\\%d_%d_%d_%d_%d_%d_%d", stTime.wYear, stTime.wMonth, stTime.wDay, stTime.wHour, stTime.wMinute, stTime.wSecond, stTime.wMilliseconds); 
+
+    char image_name[500] ;
+    sprintf_s(image_name,500, "%s%s%s", "result\\", pVideoName, ".bmp");//保存的图片名
+    cvSaveImage(image_name, image);
+}
+
+vector<char> segChar(IplImage * src,int x){
+    vector<char>imageRecLine1; //保存第一行的识别结果
+    vector<char>imageRecLine2;//保存第二行的识别结果
+
+    if((x!=1)&&(x!=2)){
+        printf("error! 必须指定是第几行！");
+    //  return NULL;
+    }
+
+//  cvErode(src,src,element,1);
+    if(showSteps)
+        cvShowImage( "src", src );
+
+    //想垂直方向投影，确定字符区域的首尾，用于分割出单个字符
+    IplImage * image = projectX(src);
+
+    if(x == 1){//第一行
+            //================判断第一个字符是否为 1 ===========================/
+        CvRect rectFirst;
+        rectFirst.height = image->height;
+        rectFirst.width = image->width/numLine1;
+        rectFirst.x = 0;
+        rectFirst.y = 0;
+        IplImage * imageRoiFirst = cvCreateImage(cvSize(rectFirst.width,rectFirst.height),8,image->nChannels);  
+        cvSetImageROI(image,rectFirst);
+        cvCopy(image,imageRoiFirst);
+        cvResetImageROI(image);
+        if(saveImage)
+            saveImages(imageRoiFirst);
+        char recResultFirst = recVifcode(imageRoiFirst);
+        if(recResultFirst == '1'){
+            /*cout<<"wwwwwwwwwwwwwwwwwwwwwwwww"<<endl;*/
+            imageRecLine2.push_back(recResultFirst);//保存第二行的第一个字符1的识别结果
+
+            const int firstLen = 20;
+            for(int i=0;i<numLine1-1;i++){
+                CvRect rect;
+                rect.height = image->height;
+                rect.width = (image->width-firstLen)/(numLine1-1);
+                rect.x = i*(image->width-firstLen)/(numLine1-1) + firstLen;
+                rect.y = 0;
+                IplImage * imageRoi = cvCreateImage(cvSize(rect.width,rect.height),8,image->nChannels); 
+                cvSetImageROI(image,rect);
+                cvCopy(image,imageRoi);
+                cvResetImageROI(image);
+
+                cvShowImage("1",imageRoi);
+                cvWaitKey(0);
+
+                if(saveImage)
+                    saveImages(imageRoi);
+                //调用识别部分代码          
+                char recResult = recVifcode(imageRoi);
+                imageRecLine2.push_back(recResult);//保存第二行的识别结果
+            }
+        }else{
+            for(int i=0;i<numLine1;i++){
+                CvRect rect;
+                rect.height = image->height;
+                rect.width = image->width/numLine1;
+                rect.x = i*image->width/numLine1;
+                rect.y = 0;
+                IplImage * imageRoi = cvCreateImage(cvSize(rect.width,rect.height),8,image->nChannels); 
+                cvSetImageROI(image,rect);
+                cvCopy(image,imageRoi);
+                cvResetImageROI(image);
+
+                cvShowImage("1",imageRoi);
+                cvWaitKey(0);
+
+                if(saveImage)
+                    saveImages(imageRoi);
+                //调用识别部分代码          
+                char recResult = recVifcode(imageRoi);
+                imageRecLine1.push_back(recResult);//保存第二行的识别结果
+            }
+        }
+
+        return imageRecLine1;
+    }
+
+    if(x == 2){//第一行
+        //================判断第一个字符是否为 1 ===========================/
+        CvRect rectFirst;
+        rectFirst.height = image->height;
+        rectFirst.width = image->width/numLine2;
+        rectFirst.x = 0;
+        rectFirst.y = 0;
+        IplImage * imageRoiFirst = cvCreateImage(cvSize(rectFirst.width,rectFirst.height),8,image->nChannels);  
+        cvSetImageROI(image,rectFirst);
+        cvCopy(image,imageRoiFirst);
+        cvResetImageROI(image);
+        if(saveImage)
+            saveImages(imageRoiFirst);
+        char recResultFirst = recVifcode(imageRoiFirst);
+        if(recResultFirst == '1'){
+            /*cout<<"wwwwwwwwwwwwwwwwwwwwwwwww"<<endl;*/
+            imageRecLine2.push_back(recResultFirst);//保存第二行的第一个字符1的识别结果
+
+            const int firstLen = 20;
+            for(int i=0;i<numLine2-1;i++){
+                CvRect rect;
+                rect.height = image->height;
+                rect.width = (image->width-firstLen)/(numLine2-1);
+                rect.x = i*(image->width-firstLen)/(numLine2-1) + firstLen;
+                rect.y = 0;
+                IplImage * imageRoi = cvCreateImage(cvSize(rect.width,rect.height),8,image->nChannels); 
+                cvSetImageROI(image,rect);
+                cvCopy(image,imageRoi);
+                cvResetImageROI(image);
+
+                cvShowImage("1",imageRoi);
+                cvWaitKey(0);
+
+                if(saveImage)
+                    saveImages(imageRoi);
+                //调用识别部分代码          
+                char recResult = recVifcode(imageRoi);
+                imageRecLine2.push_back(recResult);//保存第二行的识别结果
+            }
+        }else{
+            for(int i=0;i<numLine2;i++){
+                CvRect rect;
+                rect.height = image->height;
+                rect.width = image->width/numLine2;
+                rect.x = i*image->width/numLine2;
+                rect.y = 0;
+                IplImage * imageRoi = cvCreateImage(cvSize(rect.width,rect.height),8,image->nChannels); 
+                cvSetImageROI(image,rect);
+                cvCopy(image,imageRoi);
+                cvResetImageROI(image);
+
+                cvShowImage("1",imageRoi);
+                cvWaitKey(0);
+
+                if(saveImage)
+                    saveImages(imageRoi);
+                //调用识别部分代码          
+                char recResult = recVifcode(imageRoi);
+                imageRecLine2.push_back(recResult);//保存第二行的识别结果
+            }
+        }   
+        return imageRecLine2;
+    }
+}
+
+void printResult(vector<char> imageRecLine){
+    int recNum = imageRecLine.size();
+    for(int iNum=0;iNum<recNum;iNum++){
+        cout<<imageRecLine[iNum];
+    }
+    cout<<endl;
+}
+
+void processingTotal(){
+    initTrainImage();
+
+    char * weightFileName = "Weight.txt";
+    m_cnn.LoadWeights(weightFileName);
+
+    int imgNum = imgNames.size();
+    for(int iNum=0;iNum<imgNum;iNum++){
+
+        cout<<endl<<iNum<<endl;
+        cout<<imgNames[iNum].c_str()<<endl;
+        IplImage * src=cvLoadImage(imgNames[iNum].c_str(),1);  
+        if(!src) continue;
+
+    //  //////////////////////////////////////////////////////////////////////////////
+    //  Mat image(src);
+    //  Mat dst = image.clone();
+    ////    for ( int i = 1; i < 480; i = i + 2 ){ 
+    //      int i = 30;
+    //      bilateralFilter ( image, dst, i, i*2, i/2 );
+    //      imshow( "image", image );
+    //      imshow( "dst", dst );
+    //      waitKey ( 0 );
+    ////    }
+    //  ///////////////////////////////////////////////////////////////////////////
+        getStartTime();
+
+        IplImage * tgray = cvCreateImage(cvGetSize(src),8,1);
+        cvCvtColor(src,tgray,CV_BGR2GRAY);
+
+        IplImage * bin_image = cvCreateImage(cvGetSize(src),8,1);
+        bin_image = dehist(src,83,134);
+
+        cvErode(bin_image,bin_image,element,12);
+        if(showSteps)
+            cvShowImage( "bin_image1", bin_image );
+
+        CvMemStorage *mems=cvCreateMemStorage();
+        CvSeq *contours;
+        cvFindContours( bin_image, mems,
+            &contours,sizeof(CvContour),CV_RETR_LIST, CV_CHAIN_APPROX_SIMPLE);
+    //  cvDrawContours(src, contours, CV_RGB(0,0,255), CV_RGB(255, 0, 0), 2, 2, 8, cvPoint(0,0));
+        cvClearMemStorage( mems );
+        if(showSteps){
+            cvNamedWindow("cvDrawContours",1);
+            cvShowImage("cvDrawContours",src);
+        }
+
+
+        CvRect rect; 
+    //  char image_name[100];
+        CvSeq* first_seq = contours;
+        //  int image_num = 0;
+        for( contours=first_seq; contours != 0; contours = contours->h_next ){
+            rect = cvBoundingRect(contours);
+                cout<<rect.x<<" "<<rect.y<<" "<<rect.width<<" "<<rect.height<<endl;
+
+            //根据轮廓大小信息做筛选
+            if( (rect.width > 440)||(rect.height >  300)||
+                //      (rect.width/rect.height > 5)||
+                (rect.width*rect.height < 4500)||
+                (rect.width <  100)||(rect.height <  50)||
+                (rect.x < 0)||(rect.y < 0)||
+                (rect.x > src->width)||(rect.y > src->height)
+                )       continue;   
+            else{
+                CvPoint pt1;pt1.x = rect.x; pt1.y = rect.y;
+                CvPoint pt2;pt2.x = rect.x + rect.width; pt2.y = rect.y + rect.height;
+                if(showSteps){
+                    cvRectangle(src,pt1,pt2,CV_RGB(255,0,255),2/*CV_FILLED*/,CV_AA,0);  
+                    cout<<rect.x<<" "<<rect.y<<" "<<rect.width<<" "<<rect.height<<endl;
+                }
+
+                if(showSteps){
+                    cvNamedWindow("cvDrawContours",1);
+                    cvShowImage("cvDrawContours",src);
+                }
+                //扣出字符区域后，在对小图的字符区域做二值化，滤波，然后roi，旋转矫正？？？？？？？？？？
+                CvRect rectTemple;
+                rectTemple.x = rect.x - 5;
+                rectTemple.y = rect.y - 5;
+                rectTemple.width = rect.width + 10;
+                rectTemple.height = rect.height + 10;
+
+                IplImage* tempImage = cvCreateImage(cvSize(rectTemple.width,rectTemple.height),8,1);
+                cvSetImageROI(tgray,rectTemple);
+                cvCopy(tgray,tempImage);
+                cvResetImageROI(tgray);
+
+                cvThreshold(tempImage,tempImage,1,255,CV_THRESH_BINARY+CV_THRESH_OTSU);
+                if(showSteps){
+                    cvNamedWindow("tempImage",1);
+                    cvShowImage("tempImage",tempImage);
+                }       
+
+                CvBox2D box_outer = cvMinAreaRect2(contours);
+            //  cout<<box_outer.center.x<<" "<<box_outer.center.y<<" "<<box_outer.angle<<" "<<box_outer.size.width<<" "<<box_outer.size.height<<endl;
+
+                //旋转矫正tempImage
+                IplImage* tempImageRotate = cvCreateImage(cvGetSize(tempImage),8,1);
+                float m[6];
+                // Matrix m looks like:
+                //
+                // [ m0  m1  m2 ] ===>  [ A11  A12   b1 ]
+                // [ m3  m4  m5 ]       [ A21  A22   b2 ]
+                //
+                CvMat M = cvMat (2, 3, CV_32F, m);
+                int w = tempImage->width;
+                int h = tempImage->height;
+                if( (box_outer.angle+90.)<45 ){
+                    //  仅仅旋转
+                    int factor = 1;
+                    m[0] = (float) (factor * cos ((-1)*(box_outer.angle+90.)/2. * 2 * CV_PI / 180.));
+                    m[1] = (float) (factor * sin ((-1)*(box_outer.angle+90.)/2. * 2 * CV_PI / 180.));
+                    m[3] = (-1)*m[1];
+                    m[4] = m[0];
+                    // 将旋转中心移至图像中间
+                    m[2] = w * 0.5f;
+                    m[5] = h * 0.5f;
+                    //  dst(x,y) = A * src(x,y) + b
+                }
+                if( (box_outer.angle+90.)>45 ){
+                    //  仅仅旋转
+                    int factor = 1;
+                    m[0] = (float) (factor * cos ((-1)*(box_outer.angle)/2. * 2 * CV_PI / 180.));
+                    m[1] = (float) (factor * sin ((-1)*(box_outer.angle)/2. * 2 * CV_PI / 180.));
+                    m[3] = (-1)*m[1];
+                    m[4] = m[0];
+                    // 将旋转中心移至图像中间
+                    m[2] = w * 0.5f;
+                    m[5] = h * 0.5f;
+                    //  dst(x,y) = A * src(x,y) + b
+                }
+
+                cvZero (tempImageRotate);
+                cvGetQuadrangleSubPix (tempImage, tempImageRotate, &M);
+
+                if(showSteps){
+                    cvNamedWindow("ROI",1);
+                    cvShowImage("ROI",tempImageRotate);
+                }
+                cvReleaseImage( &tempImage );
+
+                //====================对tempImageRotate做Y轴投影===================//
+
+                IplImage* imageCharOk = projectY(tempImageRotate); 
+
+                //直接上下 均分 分割出上下两行
+                CvRect rectTop;
+                rectTop.x = 0;
+                rectTop.y = 0;
+                rectTop.width = imageCharOk->width ;
+                rectTop.height = imageCharOk->height/2;
+                IplImage* imageCharOkTop = cvCreateImage(cvSize(rectTop.width,rectTop.height),8,1);
+                cvSetImageROI(imageCharOk,rectTop);
+                cvCopy(imageCharOk,imageCharOkTop);
+                cvResetImageROI(imageCharOk);
+                if(showSteps){
+                    cvNamedWindow("imageCharOkTop",1);
+                    cvShowImage("imageCharOkTop",imageCharOkTop);
+                }
+                vector<char> results = segChar(imageCharOkTop,1);
+                printResult(results);
+
+                CvRect rectBottom;
+                rectBottom.x = 0;
+                rectBottom.y = 0 + imageCharOk->height/2;
+                rectBottom.width = imageCharOk->width ;
+                rectBottom.height = imageCharOk->height/2;
+                IplImage* imageCharOkBottom = cvCreateImage(cvSize(rectBottom.width,rectBottom.height),8,1);
+                cvSetImageROI(imageCharOk,rectBottom);
+                cvCopy(imageCharOk,imageCharOkBottom);
+                cvResetImageROI(imageCharOk);
+                if(showSteps){
+                    cvNamedWindow("imageCharOkBottom",1);
+                    cvShowImage("imageCharOkBottom",imageCharOkBottom);
+                }
+                vector<char> results2 = segChar(imageCharOkBottom,2);
+                printResult(results2);
+            }
+        }
+        getEndTime();
+        printf("%f 毫秒\n",dfTim);
+
+        cvWaitKey(0);
+        cvReleaseImage( &src );
+        cvReleaseImage( &tgray );
+        cvReleaseImage( &bin_image );
+    }
+}
+
+void main(){
+    init();
+    processingTotal();
+}
